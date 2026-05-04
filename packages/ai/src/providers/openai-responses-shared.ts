@@ -289,6 +289,10 @@ export async function processResponsesStream<TApi extends Api>(
 ): Promise<void> {
 	let currentItem: ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | null = null;
 	let currentBlock: ThinkingContent | TextContent | (ToolCall & { partialJson: string }) | null = null;
+	const blocksByOutputIndex = new Map<
+		number,
+		{ block: ThinkingContent | TextContent | (ToolCall & { partialJson: string }); contentIndex: number }
+	>();
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 
@@ -301,11 +305,13 @@ export async function processResponsesStream<TApi extends Api>(
 				currentItem = item;
 				currentBlock = { type: "thinking", thinking: "" };
 				output.content.push(currentBlock);
+				blocksByOutputIndex.set(event.output_index, { block: currentBlock, contentIndex: blockIndex() });
 				stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
 			} else if (item.type === "message") {
 				currentItem = item;
 				currentBlock = { type: "text", text: "" };
 				output.content.push(currentBlock);
+				blocksByOutputIndex.set(event.output_index, { block: currentBlock, contentIndex: blockIndex() });
 				stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
 			} else if (item.type === "function_call") {
 				currentItem = item;
@@ -317,6 +323,7 @@ export async function processResponsesStream<TApi extends Api>(
 					partialJson: item.arguments || "",
 				};
 				output.content.push(currentBlock);
+				blocksByOutputIndex.set(event.output_index, { block: currentBlock, contentIndex: blockIndex() });
 				stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
 			}
 		} else if (event.type === "response.reasoning_summary_part.added") {
@@ -427,40 +434,41 @@ export async function processResponsesStream<TApi extends Api>(
 			}
 		} else if (event.type === "response.output_item.done") {
 			const item = event.item;
+			const blockState = blocksByOutputIndex.get(event.output_index);
+			const completedBlock = blockState?.block;
+			const completedBlockIndex = blockState?.contentIndex ?? blockIndex();
 
-			if (item.type === "reasoning" && currentBlock?.type === "thinking") {
-				currentBlock.thinking = item.summary?.map((s) => s.text).join("\n\n") || "";
-				currentBlock.thinkingSignature = JSON.stringify(item);
+			if (item.type === "reasoning" && completedBlock?.type === "thinking") {
+				completedBlock.thinking = item.summary?.map((s) => s.text).join("\n\n") || "";
+				completedBlock.thinkingSignature = JSON.stringify(item);
 				stream.push({
 					type: "thinking_end",
-					contentIndex: blockIndex(),
-					content: currentBlock.thinking,
+					contentIndex: completedBlockIndex,
+					content: completedBlock.thinking,
 					partial: output,
 				});
-				currentBlock = null;
-			} else if (item.type === "message" && currentBlock?.type === "text") {
-				currentBlock.text = item.content.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("");
-				currentBlock.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
+			} else if (item.type === "message" && completedBlock?.type === "text") {
+				completedBlock.text = item.content.map((c) => (c.type === "output_text" ? c.text : c.refusal)).join("");
+				completedBlock.textSignature = encodeTextSignatureV1(item.id, item.phase ?? undefined);
 				stream.push({
 					type: "text_end",
-					contentIndex: blockIndex(),
-					content: currentBlock.text,
+					contentIndex: completedBlockIndex,
+					content: completedBlock.text,
 					partial: output,
 				});
-				currentBlock = null;
 			} else if (item.type === "function_call") {
 				const args =
-					currentBlock?.type === "toolCall" && currentBlock.partialJson
-						? parseStreamingJson(currentBlock.partialJson)
+					completedBlock?.type === "toolCall" && completedBlock.partialJson
+						? parseStreamingJson(completedBlock.partialJson)
 						: parseStreamingJson(item.arguments || "{}");
 
 				let toolCall: ToolCall;
-				if (currentBlock?.type === "toolCall") {
+				if (completedBlock?.type === "toolCall") {
 					// Finalize in-place and strip the scratch buffer so replay only
 					// carries parsed arguments.
-					currentBlock.arguments = args;
-					delete (currentBlock as { partialJson?: string }).partialJson;
-					toolCall = currentBlock;
+					completedBlock.arguments = args;
+					delete (completedBlock as { partialJson?: string }).partialJson;
+					toolCall = completedBlock;
 				} else {
 					toolCall = {
 						type: "toolCall",
@@ -470,9 +478,12 @@ export async function processResponsesStream<TApi extends Api>(
 					};
 				}
 
-				currentBlock = null;
-				stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
+				stream.push({ type: "toolcall_end", contentIndex: completedBlockIndex, toolCall, partial: output });
 			}
+			if (currentBlock === completedBlock) {
+				currentBlock = null;
+			}
+			blocksByOutputIndex.delete(event.output_index);
 		} else if (event.type === "response.completed") {
 			const response = event.response;
 			if (response?.id) {
