@@ -280,6 +280,9 @@ export function convertResponsesTools(tools: Tool[], options?: ConvertResponsesT
 // Stream processing
 // =============================================================================
 
+type ResponsesContentBlock = ThinkingContent | TextContent | (ToolCall & { partialJson: string });
+type ResponsesContentBlockState = { block: ResponsesContentBlock; contentIndex: number };
+
 export async function processResponsesStream<TApi extends Api>(
 	openaiStream: AsyncIterable<ResponseStreamEvent>,
 	output: AssistantMessage,
@@ -288,11 +291,8 @@ export async function processResponsesStream<TApi extends Api>(
 	options?: OpenAIResponsesStreamOptions,
 ): Promise<void> {
 	let currentItem: ResponseReasoningItem | ResponseOutputMessage | ResponseFunctionToolCall | null = null;
-	let currentBlock: ThinkingContent | TextContent | (ToolCall & { partialJson: string }) | null = null;
-	const blocksByOutputIndex = new Map<
-		number,
-		{ block: ThinkingContent | TextContent | (ToolCall & { partialJson: string }); contentIndex: number }
-	>();
+	let currentBlock: ResponsesContentBlock | null = null;
+	const blocksByOutputIndex = new Map<number, ResponsesContentBlockState>();
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 
@@ -301,18 +301,15 @@ export async function processResponsesStream<TApi extends Api>(
 			output.responseId = event.response.id;
 		} else if (event.type === "response.output_item.added") {
 			const item = event.item;
+			let startEventType: "thinking_start" | "text_start" | "toolcall_start" | undefined;
 			if (item.type === "reasoning") {
 				currentItem = item;
 				currentBlock = { type: "thinking", thinking: "" };
-				output.content.push(currentBlock);
-				blocksByOutputIndex.set(event.output_index, { block: currentBlock, contentIndex: blockIndex() });
-				stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
+				startEventType = "thinking_start";
 			} else if (item.type === "message") {
 				currentItem = item;
 				currentBlock = { type: "text", text: "" };
-				output.content.push(currentBlock);
-				blocksByOutputIndex.set(event.output_index, { block: currentBlock, contentIndex: blockIndex() });
-				stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
+				startEventType = "text_start";
 			} else if (item.type === "function_call") {
 				currentItem = item;
 				currentBlock = {
@@ -322,9 +319,14 @@ export async function processResponsesStream<TApi extends Api>(
 					arguments: {},
 					partialJson: item.arguments || "",
 				};
+				startEventType = "toolcall_start";
+			}
+
+			if (currentBlock && startEventType) {
 				output.content.push(currentBlock);
-				blocksByOutputIndex.set(event.output_index, { block: currentBlock, contentIndex: blockIndex() });
-				stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+				const contentIndex = blockIndex();
+				blocksByOutputIndex.set(event.output_index, { block: currentBlock, contentIndex });
+				stream.push({ type: startEventType, contentIndex, partial: output });
 			}
 		} else if (event.type === "response.reasoning_summary_part.added") {
 			if (currentItem && currentItem.type === "reasoning") {
